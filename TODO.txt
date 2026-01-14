@@ -1,1 +1,14 @@
+3	When file read fails - wait and recheck while access repaired
+2 	Support JSON5 configs
 1	Copy file to temp dir before convert
+
+
+
+check consistency - threshold 10 errors
+correct file removal:
+	- move to dest with .conv. subext
+	- remove source
+	- remove same named in dest
+	- rename
+
+skip_regex

@@ -1,190 +1,146 @@
-# PREV: none
-# INPUT: current directory context
-# OUTPUT: _convlist.txt - a list to convert
-# NEXT: conv.py
-# REQ: Python 3, FFMPEG
-
-# Recursively search working dir and subdirs for video files
-# receiving meta data of each video (resolution, bitrate)
-# File will be added to conversion list if:
-# 	a. Bitrate of video is too large for its resolution
-#	b. Video is not MP4, WEBM or OGG (not playable in browser)
-# Conversion list saved to file _convlist.txt inside working dir.
-# You can edit that list if necessary.
-# To start conversion, run "conv.py" afterwards
-
-import os
+from pathlib import Path
+import os 
+import lib
 import re
-import subprocess
-import json
-
-allowed_extensions = ('mp4','mpeg4','webm','ogg')
-
-#presets for dimension-to-bitrate decision
-presets = {
-	"high": {
-		#if LARGEST side > 1920px -> convert with video bitrate 3000kbps
-		"1920": 3000,
-		"1280": 2000,
-		"800": 1300,
-		"0": 1000
-	},
-	"mid": {
-		"1920": 2800,
-		"1280": 1800,
-		"800": 1100,
-		"0": 800
-	},
-	"low": {
-		"1920": 2000,
-		"1280": 1500,
-		"800": 1000,
-		"0": 800
-	}
-}
-
-# default config
-# You can override this config by placing file _conv_conf.json in any folder.
-# That will work for given folder and all subfolders recursively.
-c_ = {
-	"max_rate": 0.7,		# max relation of converted size to original size
-	"max_side_size": 1280,	# max not-resizable size of LARGEST side
-	"preset": "mid",
-	"convdir": "./_conv"
-}
+from subdir import Subdir
+import conf
+from conv_process import ConvProcess
+import time
 
 
-cache = {}
+class Convlist(ConvProcess):
+	all_files = []
+	
+	cache = {}
+	files = []
 
-def dive(dir,files,conf):
-	ff = os.listdir(dir)
-	new_conf = get_conf(dir,conf)
-	for f in ff:
-		full = dir+'/'+f
-		if f[0:1]!='_' and os.path.isdir(full) and not os.path.isfile(full+'/.noconv'):
-			dive(full,files,new_conf)
+	def __init__(self):
+		super().__init__("convlist")
+		self.resetLog()
+		self.cache_path = self.data_path+"/cache.json"
+		self.cache = lib.readJSON(self.cache_path,{})
+
+		conf_file = self.data_path+"/conf.json"
+		if not os.path.exists(conf_file):
+			lib.writeJSON(conf_file,{})
+		
+
+	def save_cache(self):
+		print("Saving cache...")
+		lib.writeJSON(self.cache_path, self.cache)
+		print("OK")
+
+	def run(self):
+		
+		try:
+			sd = Subdir(self)
+			sd.collect()
+		except Exception as e:
+			self.save_cache()
+			self.err(f"Subdir error: {e}")
+		except KeyboardInterrupt:
+			self.save_cache()
+			self.err(f"Aborted by user")
+			exit()
+			
+		lib.writeJSON(self.data_path+"/files.json", self.files)
+
+		print("====================================")
+		print(f"{len(self.files)} files found!")
+
+		self.printErrorsWarning()
+
+		total_size = 0
+		freed_space = 0
+		out = []
+		for f in self.files:
+			d = f["data"]
+			c = f["conf"]
+			total_size += d["size"] 
+			if d.get("error"):
+				continue
+			
+			skip_regex = c.get("skip_regex")
+			if skip_regex and re.search(skip_regex,d["relpath"],flags=re.IGNORECASE):
+				self.warn(f"rejected by regex: {d['relpath']}")
+				continue
+
+			dest = {
+				"relpath": d["relpath"],
+				"created": time.time()
+			}
+			dim = d["dim"]
+			rsz = c["max_side_size"]/max(dim)
+			if rsz < 1:
+				dim = [round(x*rsz) for x in d["dim"]]
+				dim = [x+1 if x%2 else x for x in dim]
+				dest["resize"] = dim
+			else:
+				dest["resize"] = None
+			
+			preset = conf.presets.get(c["preset"]) or conf.presets["mid"]
+			largest = max(dim)
+			bitrate = 0
+			for side in preset:
+				bitrate = preset[side]
+				if int(side) <= largest:
+					break
+
+			dest["vb"] = bitrate
+			dest["ab"] = c["audio_bitrate"]
+
+			full_bitrate = bitrate + c["audio_bitrate"]
+			rate = full_bitrate/d["full_bitrate"]
+
+			if rate > c["worst_rate"] \
+				and (not c["force_browser_playable"] or d["ext"] in conf.browser_playable_extensions):
+				continue
+
+			dest["rate"] = round(rate,2)
+			
+			new_sz = int(d["size"]*rate)
+			freed_space += d["size"]-new_sz
+
+			dest["tmpdir"] = lib.resolve(c["tmpdir"]) if "tmpdir" in c else "./_conv/tmp"			
+			hash = lib.md5(d["relpath"])
+			# print(f"UNAME {uname}")
+			dest["hash"] = hash
+			dest["result_basepath"] = c["result_basepath"]
+			dest["copy_source_to_temp"] = c["copy_source_to_temp"]
+			dest["source"] = d
+			
+
+			out.append(dest)
+
+		print(f"{len(out)} files will be converted:\n")
+
+		# for d in out:
+		# 	print(f'{d["relpath"][0:64].ljust(64)}: {d["source"]["full_bitrate"]} -> {d["vb"]+d["ab"]}')
+
+		print("\n")
+		print(f"Total size: {(total_size/(1 << 20)):10.2f} MB")
+		print(f"Space will be freed: {(freed_space/(1 << 20)):10.2f} MB")
+
+		lib.writeJSON(self.data_path+"/convlist.json", out)
+			
+
+
+
+	def cacheGet(self,relpath):
+		return self.cache[relpath] if relpath in self.cache else None
+
+	def cacheAdd(self,data,relpath=None):
+		if not relpath:
+			relpath = data["relpath"]
 		else:
-			files.append([full,new_conf])
+			data["relpath"] = relpath
+		self.cache[relpath] = data
 
-def ffmpeg_info(file):
-	pp = subprocess.Popen('ffmpeg -i "'+file+'"',shell=False,stdout=subprocess.PIPE,stderr=subprocess.PIPE);
-	s = pp.stderr.read();
-
-	mm = re.findall('(Video\:.+?|bitrate\: )(\d+)\s*kb/s',str(s))
-	mm.sort(key=lambda m:int(m[1]),reverse=True)
-	vb = int(mm[0][1])
-
-	mm = re.findall('(\d{3,4})x(\d{3,4})',str(s))
-	mm.sort(key=lambda k: int(k[0]),reverse=True)
-	dim = mm[0] if len(mm) > 0 else [0,0]
-	size = int(os.stat(file).st_size)
-	return {'vb':vb,'dim':dim,'size':size}
-
-def get_video_info(file):
-	size = int(os.stat(file).st_size)
-	if file not in cache or cache[file]['size'] != size:
-		cache[file] = ffmpeg_info(file)
-	return cache[file]
-
-def read_json(file):
-	f = open(file,'r')
-	data = json.loads(f.read())
-	f.close()
-	return data
-
-def get_conf(dir,cur_conf):
-	fname = dir+'/_conv_conf.json'
-	print(f'checking {fname}')
-	if not os.path.isfile(fname):
-		return prep_conf(cur_conf)
-
-	conf = read_json(fname)
-	c = cur_conf | conf
-	return prep_conf(c)
-
-def prep_conf(c):
-	if 'rates' not in c:
-		c['rates'] = presets[c['preset']]
-	return c
+	def addFile(self,data,cfg):
+		self.files.append({"data": data, "conf": cfg})
+		self.cacheAdd(data)
 
 
-if os.path.isfile('_convlist_cache.json'):
-	cache = read_json('_convlist_cache.json')
 
-
-ff = []
-dive('.',ff,c_)
-ff = list(filter(lambda v: re.search('(?<!\.conv)\.(mpe?g|mp4|mkv|avi|flv|mov|wmv)$',v[0].lower()),ff))
-out = []
-
-cnt=0
-for item in ff:
-	[file,c] = item
-	print(file,'...')
-	dir = os.path.dirname(file)
-	name,ext = os.path.splitext(file)
-
-	v = get_video_info(file)
-
-	vb = v['vb']
-	tvb = vb
-	w = int(v['dim'][0])
-	h = int(v['dim'][1])
-	max_side = max(w,h)
-	ar = w/h if h else 1
-
-	tw = w
-	th = h
-
-	if c['max_side_size'] and max_side > c['max_side_size']:
-		if w==max_side:
-			tw = c['max_side_size']
-			th = int(tw/ar)
-		else:
-			th = c['max_side_size']
-			tw = th*ar
-
-	tresol = tw*th
-	t_max_side = max(tw,th)
-
-	for key in c['rates']:
-		if t_max_side >= int(key):
-			tvb = c['rates'][key]
-			break
-
-	compress_rate = 0
-	compress_gain = 0
-	compress = 0
-	if vb > 0:
-		compress_rate = tvb/vb
-		compress_gain = 1-compress_rate
-		gain = round(v['size']*compress_gain/1024/1024,1)
-
-	if (ext not in allowed_extensions) or (compress_rate and compress_rate < c['max_rate']):
-		data = {
-			"file": file,
-			"sdim": str(w)+'x'+str(h),
-			"tdim": str(tw)+'x'+str(th),
-			"svb": vb,
-			"tvb": tvb,
-			"gain_mb": compress,
-			"crate": round(compress_rate,2)
-		}
-		s = file+'	'
-		for i in data:
-			#s += i+'='+str(data[i])+'; '
-			s = json.dumps(data)
-
-		out.append([s,compress])
-
-	cnt+=1
-
-out.sort(key=lambda v: v[1],reverse=True)
-fp = open('./_convlist.txt','w')
-fp.write('\n'.join(map(lambda v: v[0],out)))
-fp.close()
-
-fp = open('./_convlist_cache.json','w')
-fp.write(json.dumps(cache))
-fp.close()
-print('File convlist.txt written')
+cl = Convlist()
+cl.run()

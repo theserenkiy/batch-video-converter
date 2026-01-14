@@ -1,0 +1,6 @@
+tasks/
+__pycache__/
+*.mp4
+*.avi
+*.wmv
+*.torrent
